@@ -1,0 +1,8 @@
+IP-address: 192.168.214.241
+encryption:
+- None
+- 128Bit
+- 256Bit
+password: Sunrise!1
+port: 4840
+user: auduser
