@@ -1,15 +1,16 @@
 #!/usr/bin/python3
-from typing import Optional
+
 
 from asyncua import Client
 from asyncua import ua
 import yaml
+import sys
 import os.path
 import logging
 import asyncio
 
-logging.basicConfig(filename='Debug.log', encoding='utf-8')
-logging.basicConfig(level=logging.INFO)
+
+
 
 
 '''
@@ -29,11 +30,26 @@ TODO UA Sinumerik File Transfer:
 6. Set Overwrite Tag
 7. Check if Transfer Value is Byte-String (uft-8)
 8. Call Method, Analyse Return value
-
 '''
+
+
 def global_init():
+    init_logging()
     yamlHandler().prim_setup()
 
+
+
+def init_logging():
+    log_format = f"%(asctime)s [%(processName)s] [%(name)s] [%(levelname)s]  %(message)s"
+    log_level = logging.DEBUG
+    logging.basicConfig(
+        level = log_level,
+        format = log_format,
+        handlers = [
+            logging.FileHandler(filename='Debug.log',mode='w',encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
 
 
 #Create Class for ini Handling
@@ -85,9 +101,9 @@ class yamlHandler:
 
 
 
-
 class OPCHandler:
     def __init__(self, endpoint,user,password,security=None,cert_path=None,private_key=None):
+        self._endpoint = endpoint
         self.client = Client(endpoint)
         self.client.set_user(user)
         self.client.set_password(password)
@@ -102,84 +118,118 @@ class OPCHandler:
         '''
         if security is not None:
             self.client.set_security(security,cert_path,private_key)
-        self.client.connect()
+        logging.debug("Init successfully for endpoint: %r",endpoint)
+        return
+
+    async def __aenter__(self):
+        logging.debug("Trying to connect to endpoint: %r",self._endpoint)
+        await self.client.connect()
         return self.client
 
-    def __enter__(self):
-        self.client.connect()
-        return self.client
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.client.disconnect()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.client.disconnect()
 
 
+async def transfer_file(endpoint,user,pw,path,filename,mode='r',content='',ovr=0):
+    async with OPCHandler(endpoint,user,pw) as client:
+        logging.debug("Namespace contains %r",await client.get_namespace_array())
+        root_node = client.get_root_node()
+        logging.info("Connection Successfully. Root Node is %r",root_node)
 
-def transfer_file():
-        try:
-            client = OPCHandler('opc.tcp://192.168.214.241:4840','auduser','Sunrise!1')
-            Client.fin
-        except:
-            logging.ERROR("Unable to Connect to Endpoint.")
+        '''
+        #Find Methods node
+        '''
+        uri = 'SinumerikVarProvider'
+        namespace = await client.get_namespace_index(uri)
+        methods_node_id = ua.NodeId('/Methods',namespace)
+        methods_node = client.get_node(methods_node_id)
+        logging.debug("Methods node found %r",methods_node)
 
+        '''
+        #Create IDs for file and user handling
+        '''
+        getuserlist_id = ua.NodeId('/Methods/GetUserList',namespace)
+        adduser_id = ua.NodeId('/Methods/AddUser',namespace)
+        getmyaccessrights_id = ua.NodeId('/Methods/GetMyAccessRights', namespace)
+        giveuseraccessrights_id = ua.NodeId('/Methods/GiveUserAccess', namespace)
+        copyfiletoserver_id = ua.NodeId('/Methods/CopyFileToServer', namespace)
+        copyfilefromserver_id = ua.NodeId('/Methods/CopyFileFromServer', namespace)
 
+        '''
+        #Get Nodes for File and User Handling
+        '''
+        getuserlist = client.get_node(getuserlist_id)
+        adduser = client.get_node(adduser_id)
+        getmyaccessrights = client.get_node(getmyaccessrights_id)
+        giveuseraccessrights = client.get_node(giveuseraccessrights_id)
+        copyfiletoserver = client.get_node(copyfiletoserver_id)
+        copyfilefromserver = client.get_node(copyfilefromserver_id)
 
-        file_node = client.get_node("ns=2;s=/Methods")
-        #1. user auslesen und verifizieren
-        #2. user entsprechende Berechtigung erteilen
-        #3. Methoden Knoten auslesen
-        #4. Entsprechende Methode finden und merken
-        #5. Input/Output Argumente erstellen
-        # File Transfer -> Text muss als Byte-String (encode('utf8')) vorliegen
-        # File lesen -> Text aus Byte-String decodiert und gespeichert werden
-        # Argutmente und Datentypen lassen sich mit UAExpert ermitteln
-        #6. Methode aufrufen
-        #7. WIN
-
-        methods = await file_node.get_methods()
-        print(methods)
-        GiveUserAccess = methods[9]
-        GetUserList = methods[8]
-        GetMyAccessRights = methods[6]
-        CopyFileFromServer = methods[2]
-        CopyFileToServer = methods[3]
-
+        '''
+        #Set Rights for File Transfer
+        '''
         usr_arg = ua.Variant()
         usr_arg.VariantType = ua.VariantType.String
-        usr_arg.Value = "auduser"
-        right_arg = ua.Variant()
-        right_arg.VariantType = ua.VariantType.String
-        right_arg.Value = "SinuWriteAll"
-        #right_arg.Value = "SinuReadAll"
-        await file_node.call_method(GiveUserAccess, usr_arg,right_arg)
+        usr_arg.Value = user
+        rights_arg = ua.Variant()
+        rights_arg.VariantType = ua.VariantType.String
+        rights_arg.Value = 'SinuWriteAll;SinuReadAll'
 
 
 
+        try:
+            await methods_node.call_method(giveuseraccessrights, usr_arg,rights_arg)
+            logging.debug(f"Successfully given rights {rights_arg} to user {usr_arg}")
+        except:
+            logging.debug(f"Failed giving rights {rights_arg} to user {usr_arg}. System Exit!")
+            sys.exit()
 
+        '''
+        #Build Path and Content Arguments
+        • Sinumerik/FileSystem/Part Program/partprg.mpf
+        • Sinumerik/FileSystem/Sub Program/subprg.spf
+        • Sinumerik/FileSystem/Work Pieces/wrkprg.wpf
+        • Sinumerik/FileSystem/NCExtend/Program.mpf
+        • Sinumerik/FileSystem/ExtendedDrives/USBdrive/Q3.mpf
+        '''
         arg_path = ua.Variant()
         arg_path.VariantType = ua.VariantType.String
-        arg_path.Value = "Sinumerik/FileSystem/Part Program/KREIS_XZ.mpf"
-        arg = await file_node.call_method(CopyFileFromServer,arg_path)
-        print("")
-        print("--Programm lesen--")
-        print("KREIS_XZ.mpf")
-        print(str(arg,'utf-8'))
+        arg_path.Value = f"Sinumerik/FileSystem/{path}/{filename}"
 
+        arg_content = ua.Variant()
+        arg_content.VariantType = ua.VariantType.ByteString
+        byte_string = bytes(content,'utf-8')
+        arg_content.Value = byte_string
 
-
-        arg_path.Value = "Sinumerik/FileSystem/Part Program/TEST_RR.mpf"
-        arg_string = ua.Variant()
-        arg_string.VariantType = ua.VariantType.ByteString
-        arg_string.Value = "TEST String OVERWRITE".encode('utf-8')
         arg_overwrite = ua.Variant()
         arg_overwrite.VariantType = ua.VariantType.Boolean
-        arg_overwrite.Value = False
-        ret =await file_node.call_method(CopyFileToServer,arg_path,arg_string,arg_overwrite)
-        print(ret)
+        arg_overwrite.Value = ovr
+
+        if mode == 'r':
+            logging.debug(f"Reading File {arg_path.Value} from server")
+            content = await methods_node.call_method(copyfilefromserver,arg_path)
+        elif mode == 'w':
+            print(arg_content.Value)
+            logging.debug(f"Writing to File {arg_path.Value} from server")
+            content = await methods_node.call_method(copyfiletoserver,arg_path,arg_content,arg_overwrite)
+        else:
+            content = 0
+        logging.debug(f"Return value is: {content}")
+        return content
+
 
 
 
 
 if __name__ == "__main__":
     global_init()
-    transfer_file()
-
+    endpoint = 'opc.tcp://192.168.214.241:4840'
+    user = 'auduser'
+    password = 'Sunrise!1'
+    path = 'Part Program'
+    filename = 'TEST_RR.mpf'
+    mode = 'w'
+    content = 'Hallo Welt'
+    ovr = 1
+    val = asyncio.run(transfer_file(endpoint,user,password,path,filename,mode,content,ovr))
+    logging.debug(f"Return value is {val.decode('utf-8')}")
