@@ -3,6 +3,8 @@
 
 from asyncua import Client
 from asyncua import ua
+from asyncua.ua import uaerrors
+from asyncua.ua.uaerrors import UaStatusCodeError
 import yaml
 import sys
 import os.path
@@ -14,22 +16,11 @@ import asyncio
 
 
 '''
-TODO UA Sinumerik File Transfer:
-
-1.  Check Endpoint, User, Password, Encryption
-    Create Connection with Server
-//2. Verify User and target
-3. Create/Elevate internal User to SinuWriteAll or SinuReadAll
-4. Read Methods Node, Check if TransferFileToServer/ReadFileFromServer exists
-5. Translate Target Path
-• Sinumerik/FileSystem/Part Program/partprg.mpf
-• Sinumerik/FileSystem/Sub Program/subprg.spf
-• Sinumerik/FileSystem/Work Pieces/wrkprg.wpf
-• Sinumerik/FileSystem/NCExtend/Program.mpf
-• Sinumerik/FileSystem/ExtendedDrives/USBdrive/Q3.mpf
-6. Set Overwrite Tag
-7. Check if Transfer Value is Byte-String (uft-8)
-8. Call Method, Analyse Return value
+UA Sinumerik File Transfer:
+!!!Rollback to internal Methods because direct access of the node
+doesn't give a feedback when Operate permission is invalid!!!
+current accLevel: /Nck/Configuration/accessLevel
+f.e. accLvl Part Program: /NC/_N_NC_TEA_ACX_/$MNS_ACCESS_WRITE_PROGRAM
 '''
 
 
@@ -42,9 +33,10 @@ def global_init():
 def init_logging():
     log_format = f"%(asctime)s [%(processName)s] [%(name)s] [%(levelname)s]  %(message)s"
     log_level = logging.DEBUG
+    # noinspection PyArgumentList
     logging.basicConfig(
-        level = log_level,
         format = log_format,
+        level = log_level,
         handlers = [
             logging.FileHandler(filename='Debug.log',mode='w',encoding='utf-8'),
             logging.StreamHandler(sys.stdout)
@@ -138,6 +130,7 @@ async def transfer_file(endpoint,user,pw,path,filename,mode='r',content='',ovr=0
 
         '''
         #Find Methods node
+        #Issue: Methods node is tied to Operate protection level
         '''
         uri = 'SinumerikVarProvider'
         namespace = await client.get_namespace_index(uri)
@@ -173,7 +166,7 @@ async def transfer_file(endpoint,user,pw,path,filename,mode='r',content='',ovr=0
         usr_arg.Value = user
         rights_arg = ua.Variant()
         rights_arg.VariantType = ua.VariantType.String
-        rights_arg.Value = 'SinuWriteAll;SinuReadAll'
+        rights_arg.Value = 'SinuWriteAll;SinuReadAll;FsRead;FsWrite'
 
 
 
@@ -192,29 +185,84 @@ async def transfer_file(endpoint,user,pw,path,filename,mode='r',content='',ovr=0
         • Sinumerik/FileSystem/NCExtend/Program.mpf
         • Sinumerik/FileSystem/ExtendedDrives/USBdrive/Q3.mpf
         '''
+        file_node_str = f'Sinumerik/FileSystem/{path}/{filename.upper()}'
+        file_node_id = ua.NodeId(file_node_str,namespace)
+        file_node = client.get_node(file_node_id)
+        logging.debug(f'Filesystem node created {file_node}')
+
         arg_path = ua.Variant()
         arg_path.VariantType = ua.VariantType.String
-        arg_path.Value = f"Sinumerik/FileSystem/{path}/{filename}"
+        arg_path.Value = f'Sinumerik/FileSystem/{path}/{filename}'
 
         arg_content = ua.Variant()
         arg_content.VariantType = ua.VariantType.ByteString
         byte_string = bytes(content,'utf-8')
         arg_content.Value = byte_string
 
-        arg_overwrite = ua.Variant()
-        arg_overwrite.VariantType = ua.VariantType.Boolean
-        arg_overwrite.Value = ovr
+        arg_ovr = ua.Variant()
+        arg_ovr.VariantType = ua.VariantType.Boolean
+        arg_ovr.Value = ovr
+
+        arg_open_mode = ua.Variant()
+        arg_open_mode.VariantType = ua.VariantType.Byte
+        arg_open_mode.Value = 255 #1,5,9
+
+
+
+        arg_ptr_pos = ua.Variant()
+        arg_ptr_pos.VariantType = ua.VariantType.UInt64
+        if ovr:
+            arg_ptr_pos.Value = 0
+        else:
+            arg_ptr_pos.Value = -1
+
+
+        '''
+        #Check file existence and user permission 
+        '''
+        ex = (len(await file_node.get_children()) > 0)
+        print(f'Boolean check if file exists is: {ex}')
+        if ex:
+            writable_node_id = ua.NodeId(file_node_str + '.UserWritable',namespace)
+            writable_node = client.get_node(writable_node_id)
+            usr_writable = await writable_node.get_value()
+            logging.debug(f'Boolean check if file is writeable is: {usr_writable}')
+
+
+        '''
+        #Create ids and nodes for filesystem handling
+        '''
+        create_file = client.get_node(ua.NodeId(f'Sinumerik/FileSystem/{path}.CreateFile',namespace))
+        delete_file = client.get_node(ua.NodeId(f'Sinumerik/FileSystem/{path}.Delete', namespace))
+        open_file = client.get_node(ua.NodeId(f'Sinumerik/FileSystem/{path}/{filename.upper()}.Open', namespace))
+        read_file = client.get_node(ua.NodeId(f'Sinumerik/FileSystem/{path}/{filename.upper()}.Read', namespace))
+        get_ptr_file = client.get_node(ua.NodeId(f'Sinumerik/FileSystem/{path}/{filename.upper()}.GetPosition', namespace))
+        set_ptr_file = client.get_node(ua.NodeId(f'Sinumerik/FileSystem/{path}/{filename.upper()}.SetPosition', namespace))
+        write_file = client.get_node(ua.NodeId(f'Sinumerik/FileSystem/{path}/{filename.upper()}.Write', namespace))
+        close_file = client.get_node(ua.NodeId(f'Sinumerik/FileSystem/{path}/{filename.upper()}.Close', namespace))
 
         if mode == 'r':
-            logging.debug(f"Reading File {arg_path.Value} from server")
-            content = await methods_node.call_method(copyfilefromserver,arg_path)
+            logging.debug(f"Reading File {filename} from server")
+            if ex:
+                content = await methods_node.call_method(copyfilefromserver,arg_path)
+            else:
+                logging.debug(f'file {filename} does not exist.')
+                content = 0
         elif mode == 'w':
-            print(arg_content.Value)
-            logging.debug(f"Writing to File {arg_path.Value} from server")
-            content = await methods_node.call_method(copyfiletoserver,arg_path,arg_content,arg_overwrite)
+            logging.debug(f"Writing to File {path}/{filename} on server")
+            try:
+                await methods_node.call_method(copyfiletoserver, arg_path, arg_content,arg_ovr)
+            except uaerrors.BadNotSupported:
+                access_lvl = await client.get_node(ua.NodeId('/Nck/Configuration/accessLevel',namespace)).read_value()
+                logging.error(f'Operate access level not sufficient. Current access level is {access_lvl}')
+            except Exception as ex:
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+                message = template.format(type(ex).__name__, ex.args)
+                logging.error(message)
         else:
+            raise Exception("No mode specified")
             content = 0
-        logging.debug(f"Return value is: {content}")
+        logging.debug(f'function return value is: {content}')
         return content
 
 
@@ -232,4 +280,5 @@ if __name__ == "__main__":
     content = 'Hallo Welt'
     ovr = 1
     val = asyncio.run(transfer_file(endpoint,user,password,path,filename,mode,content,ovr))
-    logging.debug(f"Return value is {val.decode('utf-8')}")
+    if mode == 'r':
+        logging.debug(f"Return value is {val.decode('utf-8')}")
