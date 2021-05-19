@@ -4,7 +4,6 @@
 from asyncua import Client
 from asyncua import ua
 from asyncua.ua import uaerrors
-from asyncua.ua.uaerrors import UaStatusCodeError
 import yaml
 import sys
 import os.path
